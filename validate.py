@@ -1,10 +1,14 @@
-"""Validation script: fetch sample stocks and run full Phase 1+2 pipeline."""
+"""Validation script: fetch sample stocks and run full Phase 1+2+3 pipeline."""
 
 from __future__ import annotations
 
+import requests
+
+from src.analysis.elasticity import calculate as calc_elasticity
 from src.analysis.mine_sweeper import sweep
 from src.analysis.scoring import score
 from src.analysis.screening import red_line_check, veto_check
+from src.analysis.valuation import evaluate
 from src.analysis.warnings import analyze
 from src.data_sources.adapter import DataSourceAdapter
 from src.indicators.calculator import calc_indicators
@@ -14,6 +18,31 @@ SAMPLE_STOCKS = [
     ("601318.SH", "中国平安"),
     ("000001.SZ", "平安银行"),
 ]
+
+
+def _fetch_market_cap(ts_code: str) -> float | None:
+    """从腾讯财经获取实时总市值（元）。"""
+    symbol = ts_code.split(".")[0]
+    prefix = "sh" if ts_code.endswith(".SH") else "sz"
+    try:
+        r = requests.get(
+            f"https://qt.gtimg.cn/q={prefix}{symbol}",
+            timeout=10,
+        )
+        r.raise_for_status()
+        # v_sh600519="1~名称~代码~...~总市值~..."
+        text = r.text
+        start = text.find('"')
+        end = text.rfind('"')
+        if start == -1 or end == -1 or start == end:
+            return None
+        fields = text[start + 1 : end].split("~")
+        if len(fields) > 44:
+            # 字段 44 为总市值，单位亿元
+            return float(fields[44]) * 1e8
+        return None
+    except Exception:
+        return None
 
 
 def main() -> None:
@@ -29,10 +58,13 @@ def main() -> None:
             continue
 
         data.indicators = calc_indicators(data)
+        mcap = _fetch_market_cap(ts_code)
 
         print(f"  Name: {data.stock_info.name}")
         print(f"  Industry: {data.stock_info.industry}")
         print(f"  Periods fetched: {len(data.income_statements)}")
+        if mcap:
+            print(f"  Market Cap:     {mcap:,.0f}")
 
         print("\n  Key Indicators (latest period):")
         if data.indicators:
@@ -94,6 +126,40 @@ def main() -> None:
         print(f"    Action:      {ws.action}")
         for s in ws.signals:
             print(f"    📡 {s}")
+
+        # Phase 3: Valuation
+        if mcap:
+            print("\n  [Phase 3] Valuation:")
+            val = evaluate(data, current_market_cap=mcap, reasonable_pb=1.5)
+            if val.current_pb:
+                print(f"    Current PB:          {val.current_pb:.2f}")
+            if val.pb_percentile is not None:
+                print(f"    PB Percentile:       {val.pb_percentile:.1f}%")
+            if val.cycle_adjusted_pe:
+                print(f"    Cycle-Adjusted PE:   {val.cycle_adjusted_pe:.1f}")
+            if val.avg_profit:
+                print(f"    Avg Profit:          {val.avg_profit:,.0f}")
+            if val.profit_cv is not None:
+                print(f"    Profit CV:           {val.profit_cv:.2f}")
+            if val.safety_margin is not None:
+                direction = "undervalued" if val.safety_margin > 0 else "overvalued"
+                print(f"    Safety Margin:       {val.safety_margin:+.1%} ({direction})")
+            for n in val.notes:
+                print(f"    ℹ️  {n}")
+
+            # Phase 3: Profit Elasticity
+            print("\n  [Phase 3] Profit Elasticity:")
+            el = calc_elasticity(data, current_market_cap=mcap)
+            if el.historical_elasticity:
+                print(f"    Historical Elasticity: {el.historical_elasticity:.1f}x")
+            for s in el.scenarios:
+                print(
+                    f"    {s.name:4s}  Profit={s.net_profit:>12,.0f}  "
+                    f"PE={s.target_pe:.0f}  ImpliedCap={s.implied_market_cap:>15,.0f}  "
+                    f"Upside={s.upside_pct:+.1f}%"
+                )
+            for n in el.notes:
+                print(f"    ℹ️  {n}")
 
 
 def fmt(value: float | None) -> str:
